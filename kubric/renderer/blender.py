@@ -63,7 +63,7 @@ class Blender(core.View):
                scratch_dir=None,
                adaptive_sampling=False,
                use_denoising=True,
-               samples_per_pixel=128,
+               samples_per_pixel=32,
                background_transparency=False,
                verbose: bool = False,
                custom_scene: Optional[str] = None,
@@ -106,7 +106,7 @@ class Blender(core.View):
     # the ray-tracing engine is set here because it affects the availability of some features
     bpy.context.scene.render.engine = "CYCLES"
     self.use_gpu = os.getenv("KUBRIC_USE_GPU", "False").lower() in ("true", "1", "t")
-
+    print(f"Using GPU: {self.use_gpu}")
     blender_utils.activate_render_passes(normal=True, optical_flow=True, segmentation=True, uv=True)
     self._setup_scene_shading()
 

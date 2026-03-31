@@ -39,6 +39,7 @@ def as_path(path: PathLike) -> epath.Path:
   Instead of pathlib.Path, we use `epath` because it transparently
   supports paths to GCS buckets such as "gs://kubric-public/GSO".
   """
+  print(f"Converting {path} to epath.Path")
   return epath.Path(path)
 
 
@@ -65,7 +66,9 @@ def write_json(data: Any, filename: PathLike) -> None:
 
 
 def read_json(filename: PathLike) -> Any:
+  print("read_json opening", filename)
   with gopen(filename, "r") as fp:
+    print("read_json opened", filename)
     return json.load(fp, )
 
 

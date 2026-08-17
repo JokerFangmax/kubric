@@ -14,11 +14,14 @@
 
 import difflib
 import functools
+import hashlib
 import logging
+import os
 import pathlib
 import shutil
 import tarfile
 import tempfile
+import time
 
 import numpy as np
 import tensorflow as tf
@@ -63,7 +66,8 @@ class AssetSource(ClosableResource):
   def from_manifest(
       cls,
       manifest_path: PathLike,
-      scratch_dir: Optional[PathLike] = None
+      scratch_dir: Optional[PathLike] = None,
+      cache_dir: Optional[PathLike] = None,
   ) -> "AssetSource":
     if manifest_path == "gs://kubric-public/assets/ShapeNetCore.v2.json":
       raise ValueError(f"The path `{manifest_path}` is a placeholder for the real path. "
@@ -72,33 +76,53 @@ class AssetSource(ClosableResource):
                        "https://shapenet.org/download/kubric")
 
     manifest_path = file_io.as_path(manifest_path)
+    if cache_dir == "":
+      cache_dir = None
+    cache_dir = None if cache_dir is None else pathlib.Path(cache_dir)
+    if cache_dir is not None:
+      manifest_path = cls._cache_manifest_file(manifest_path, cache_dir)
     manifest = file_io.read_json(manifest_path)
     name = manifest.get("name", manifest_path.stem)  # default to filename
     data_dir = manifest.get("data_dir", manifest_path.parent)  # default to manifest dir
     assets = manifest["assets"]
-    return cls(name=name, data_dir=data_dir, assets=assets, scratch_dir=scratch_dir)
+    return cls(
+        name=name,
+        data_dir=data_dir,
+        assets=assets,
+        scratch_dir=scratch_dir,
+        cache_dir=cache_dir)
 
   def __init__(
       self,
       name: str,
       data_dir: PathLike,
       assets: Dict[str, Any],
-      scratch_dir: Optional[PathLike] = None
+      scratch_dir: Optional[PathLike] = None,
+      cache_dir: Optional[PathLike] = None,
   ):
     super().__init__()
     self.name = name
     self.data_dir = file_io.as_path(data_dir)
+    self.cache_dir = None if cache_dir is None else pathlib.Path(cache_dir)
+    self._uses_persistent_cache = self.cache_dir is not None
     logging.info("Created AssetSource '%s' with '%d' assets at URI='%s'",
                  name, len(assets), self.data_dir)
-    self.local_dir = pathlib.Path(tempfile.mkdtemp(prefix=name, dir=scratch_dir))
+    if self._uses_persistent_cache:
+      cache_key = hashlib.sha1(str(self.data_dir).encode("utf-8")).hexdigest()[:12]
+      self.local_dir = self.cache_dir / f"{name}_{cache_key}"
+      self.local_dir.mkdir(parents=True, exist_ok=True)
+    else:
+      self.local_dir = pathlib.Path(tempfile.mkdtemp(prefix=name, dir=scratch_dir))
     self._assets = assets
 
   def close(self):
     if self.is_closed:
       return
     try:
-      shutil.rmtree(self.local_dir)
+      if not self._uses_persistent_cache:
+        shutil.rmtree(self.local_dir)
     finally:
+      self.is_closed = True
       super().close()
 
   def __enter__(self):
@@ -218,27 +242,113 @@ class AssetSource(ClosableResource):
 
   def fetch(self, asset_path, asset_id):
     local_path = self.local_dir / (asset_id + ".tar.gz")
-    if not local_path.exists():
-      logging.debug("Copying %s to %s", str(asset_path), str(local_path))
-      local_path.parent.mkdir(parents=True, exist_ok=True)
-      tf.io.gfile.copy(asset_path, local_path)
+    asset_dir = self.local_dir / asset_id
+    if self._is_asset_dir_ready(asset_dir):
+      return asset_dir
 
-      with tarfile.open(local_path, "r:gz") as tar:
-        # We support two kinds of archives:
-        #  1. flat archives that do not contain any directories
-        #  2. archives where the content is in a directory with the name of the asset
-        list_of_files = tar.getnames()
-        if asset_id in list_of_files and tar.getmember(asset_id).isdir():
-          # tarfile contains directory with name object_id, so we can just extract
-          assert f"{asset_id}/data.json" in list_of_files, list_of_files
-          tar.extractall(self.local_dir)
-        else:
-          # tarfile contains files only, so extract into a new directory
-          assert "data.json" in list_of_files, list_of_files
-          tar.extractall(self.local_dir / asset_id)
-        logging.debug("Extracted %s", repr([m.name for m in tar.getmembers()]))
+    self.local_dir.mkdir(parents=True, exist_ok=True)
+    lock_dir = self.local_dir / ".locks" / asset_id
+    with self._directory_lock(lock_dir):
+      if self._is_asset_dir_ready(asset_dir):
+        return asset_dir
+
+      if not local_path.exists():
+        logging.info("Caching asset %s from %s", asset_id, str(asset_path))
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = local_path.with_suffix(local_path.suffix + f".tmp.{os.getpid()}")
+        if tmp_path.exists():
+          tmp_path.unlink()
+        tf.io.gfile.copy(asset_path, tmp_path)
+        os.replace(tmp_path, local_path)
+
+      if not self._is_asset_dir_ready(asset_dir):
+        self._extract_asset_archive(local_path, asset_id, asset_dir)
 
     return self.local_dir / asset_id
+
+  @staticmethod
+  def _is_asset_dir_ready(asset_dir: pathlib.Path) -> bool:
+    return asset_dir.exists() and (asset_dir / "data.json").exists()
+
+  @classmethod
+  def _is_asset_ready(cls, local_path: pathlib.Path, asset_dir: pathlib.Path) -> bool:
+    return local_path.exists() and cls._is_asset_dir_ready(asset_dir)
+
+  @staticmethod
+  def _directory_lock(lock_dir: pathlib.Path, timeout: float = 600.0, poll: float = 0.2):
+    class _LockContext:
+      def __enter__(self_nonlocal):
+        start_time = time.time()
+        lock_dir.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+          try:
+            lock_dir.mkdir()
+            return self_nonlocal
+          except FileExistsError:
+            if time.time() - start_time > timeout:
+              raise TimeoutError(f"Timed out waiting for cache lock {lock_dir}")
+            time.sleep(poll)
+
+      def __exit__(self_nonlocal, exc_type, exc_val, exc_tb):
+        shutil.rmtree(lock_dir, ignore_errors=True)
+        return False
+
+    return _LockContext()
+
+  @staticmethod
+  def _cache_manifest_file(manifest_path: PathLike, cache_dir: pathlib.Path) -> PathLike:
+    manifest_path = file_io.as_path(manifest_path)
+    manifest_cache_dir = cache_dir / "_manifests"
+    manifest_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_name = pathlib.Path(str(manifest_path)).name
+    manifest_key = hashlib.sha1(str(manifest_path).encode("utf-8")).hexdigest()[:12]
+    cached_manifest_path = manifest_cache_dir / f"{manifest_name}.{manifest_key}"
+    if cached_manifest_path.exists():
+      return cached_manifest_path
+
+    lock_dir = manifest_cache_dir / ".locks" / manifest_key
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    with AssetSource._directory_lock(lock_dir):
+      if cached_manifest_path.exists():
+        return cached_manifest_path
+      logging.info("Caching manifest %s to %s", manifest_path, cached_manifest_path)
+      tmp_path = cached_manifest_path.with_suffix(cached_manifest_path.suffix + f".tmp.{os.getpid()}")
+      if tmp_path.exists():
+        tmp_path.unlink()
+      tf.io.gfile.copy(manifest_path, tmp_path)
+      os.replace(tmp_path, cached_manifest_path)
+    return cached_manifest_path
+
+  def _extract_asset_archive(self, local_path: pathlib.Path, asset_id: str, asset_dir: pathlib.Path):
+    extract_root = self.local_dir / f".extract_{asset_id}_{os.getpid()}"
+    shutil.rmtree(extract_root, ignore_errors=True)
+    extract_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+      with tarfile.open(local_path, "r:gz") as tar:
+        list_of_files = tar.getnames()
+        if asset_id in list_of_files and tar.getmember(asset_id).isdir():
+          assert f"{asset_id}/data.json" in list_of_files, list_of_files
+          tar.extractall(extract_root)
+          extracted_dir = extract_root / asset_id
+        else:
+          assert "data.json" in list_of_files, list_of_files
+          extracted_dir = extract_root / asset_id
+          extracted_dir.mkdir(parents=True, exist_ok=True)
+          tar.extractall(extracted_dir)
+        logging.debug("Extracted %s", repr([m.name for m in tar.getmembers()]))
+
+      if self._is_asset_dir_ready(asset_dir):
+        return
+
+      try:
+        os.replace(extracted_dir, asset_dir)
+      except FileExistsError:
+        if not self._is_asset_dir_ready(asset_dir):
+          raise
+    finally:
+      shutil.rmtree(extract_root, ignore_errors=True)
 
   def get_test_split(self, fraction=0.1):
     """

@@ -18,3 +18,4 @@ Dockerfile
 output_tmp/*
 viz_out/*
 .codex
+new_output/*

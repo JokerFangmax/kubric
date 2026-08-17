@@ -242,154 +242,159 @@ kb.as_path("output").mkdir(exist_ok=True)
 renderer.save_state(f"{out_dir}/{FLAGS.object}.blend")
 frames_dict = renderer.render()
 
+# 只保留 depth, normal 和 rgba 通道
+frames_dict = {k: v for k, v in frames_dict.items() if k in ['depth', 'normal', 'rgba']}
+
+# 保存选定的图像通道
+kb.write_image_dict(frames_dict, f"{out_dir}")
 
 # with open(f"{out_dir}/frames.dict", "wb") as file:
 #   pickle.dump(frames_dict, file)
 
-# kb.write_image_dict(frames_dict, f"{out_dir}")
+# # kb.write_image_dict(frames_dict, f"{out_dir}")
 
 
-# convert segmentation mask to LASR style
-palette = [[0, 0, 0], [0, 0, 0], [128, 128, 128], [
-    128, 128, 128], [128, 128, 128], [128, 128, 128]]
-kb.file_io.multi_write_image(
-    frames_dict["segmentation"],
-    str(kb.as_path(
-        f"{out_dir}/LASR/Annotations/Full-Resolution/{FLAGS.object}") / "{:05d}.png"),
-    write_fn=kb.write_palette_png,
-    max_write_threads=16,
-    palette=palette
-)
-kb.file_io.multi_write_image(
-    frames_dict["segmentation"],
-    str(kb.as_path(
-        f"{out_dir}/LASR/Annotations/Full-Resolution/r{FLAGS.object}") / "{:05d}.png"),
-    write_fn=kb.write_palette_png,
-    max_write_threads=16,
-    palette=[[0, 0, 0], [0, 0, 0], [1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]
-)
+# # convert segmentation mask to LASR style
+# palette = [[0, 0, 0], [0, 0, 0], [128, 128, 128], [
+#     128, 128, 128], [128, 128, 128], [128, 128, 128]]
+# kb.file_io.multi_write_image(
+#     frames_dict["segmentation"],
+#     str(kb.as_path(
+#         f"{out_dir}/LASR/Annotations/Full-Resolution/{FLAGS.object}") / "{:05d}.png"),
+#     write_fn=kb.write_palette_png,
+#     max_write_threads=16,
+#     palette=palette
+# )
+# kb.file_io.multi_write_image(
+#     frames_dict["segmentation"],
+#     str(kb.as_path(
+#         f"{out_dir}/LASR/Annotations/Full-Resolution/r{FLAGS.object}") / "{:05d}.png"),
+#     write_fn=kb.write_palette_png,
+#     max_write_threads=16,
+#     palette=[[0, 0, 0], [0, 0, 0], [1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]
+# )
 
-kb.file_io.multi_write_image(
-    frames_dict["rgba"],
-    str(kb.as_path(
-        f"{out_dir}/LASR/JPEGImages/Full-Resolution/{FLAGS.object}") / "{:05d}.png"),
-    write_fn=kb.write_png,
-    max_write_threads=16
-)
-
-
-# write optical flow and occlusion map in LASR format
-def write_pfm(path, image, scale=1):
-  """Write pfm file.
-
-  Args:
-      path (str): pathto file
-      image (array): data
-      scale (int, optional): Scale. Defaults to 1.
-  """
-
-  with open(path, "wb") as file:
-    color = None
-
-    if image.dtype.name != "float32":
-      raise Exception("Image dtype must be float32.")
-
-    image = np.flipud(image)
-
-    if len(image.shape) == 3 and image.shape[2] == 3:  # color image
-      color = True
-    elif (
-        len(image.shape) == 2 or len(image.shape) == 3 and image.shape[2] == 1
-    ):  # greyscale
-      color = False
-    else:
-      raise Exception(
-          "Image must have H x W x 3, H x W x 1 or H x W dimensions.")
-
-    file.write("PF\n".encode() if color else "Pf\n".encode())
-    file.write("%d %d\n".encode() % (image.shape[1], image.shape[0]))
-
-    endian = image.dtype.byteorder
-
-    if endian == "<" or endian == "=" and sys.byteorder == "little":
-      scale = -scale
-
-    file.write("%f\n".encode() % scale)
-
-    image.tofile(file)
+# kb.file_io.multi_write_image(
+#     frames_dict["rgba"],
+#     str(kb.as_path(
+#         f"{out_dir}/LASR/JPEGImages/Full-Resolution/{FLAGS.object}") / "{:05d}.png"),
+#     write_fn=kb.write_png,
+#     max_write_threads=16
+# )
 
 
-fw = frames_dict["forward_flow"][:-1, ...] * 256
-bw = frames_dict["backward_flow"][1:, ...] * 256
-imgs = frames_dict["rgba"]
-M, N = imgs.shape[1:3]
+# # write optical flow and occlusion map in LASR format
+# def write_pfm(path, image, scale=1):
+#   """Write pfm file.
 
-occs = np.ones(fw.shape[:-1]).astype("float32")
+#   Args:
+#       path (str): pathto file
+#       image (array): data
+#       scale (int, optional): Scale. Defaults to 1.
+#   """
+
+#   with open(path, "wb") as file:
+#     color = None
+
+#     if image.dtype.name != "float32":
+#       raise Exception("Image dtype must be float32.")
+
+#     image = np.flipud(image)
+
+#     if len(image.shape) == 3 and image.shape[2] == 3:  # color image
+#       color = True
+#     elif (
+#         len(image.shape) == 2 or len(image.shape) == 3 and image.shape[2] == 1
+#     ):  # greyscale
+#       color = False
+#     else:
+#       raise Exception(
+#         "Image must have H x W x 3, H x W x 1 or H x W dimensions.")
+
+#     file.write("PF\n".encode() if color else "Pf\n".encode())
+#     file.write("%d %d\n".encode() % (image.shape[1], image.shape[0]))
+
+#     endian = image.dtype.byteorder
+
+#     if endian == "<" or endian == "=" and sys.byteorder == "little":
+#       scale = -scale
+
+#     file.write("%f\n".encode() % scale)
+
+#     image.tofile(file)
 
 
-os.makedirs(
-    f"{out_dir}/LASR/FlowFW/Full-Resolution/{FLAGS.object}", exist_ok=True)
-os.makedirs(
-    f"{out_dir}/LASR/FlowBW/Full-Resolution/{FLAGS.object}", exist_ok=True)
-os.makedirs(
-    f"{out_dir}/LASR/FlowFW/Full-Resolution/r{FLAGS.object}", exist_ok=True)
-os.makedirs(
-    f"{out_dir}/LASR/FlowBW/Full-Resolution/r{FLAGS.object}", exist_ok=True)
-os.makedirs(
-    f"{out_dir}/LASR/Camera/Full-Resolution/{FLAGS.object}", exist_ok=True)
-os.makedirs(
-    f"{out_dir}/LASR/Camera/Full-Resolution/r{FLAGS.object}", exist_ok=True)
+# fw = frames_dict["forward_flow"][:-1, ...] * 256
+# bw = frames_dict["backward_flow"][1:, ...] * 256
+# imgs = frames_dict["rgba"]
+# M, N = imgs.shape[1:3]
 
-# write flows into pfm
-for i in range(len(fw)):
-  f = fw[i, ...]
-  ones = np.ones_like(f[..., :1])
-  f = np.concatenate([f[..., 1:], f[..., :1], ones], -1)
-  b = np.concatenate([-bw[i, ..., 1:], -bw[i, ..., :1], ones], -1)
+# occs = np.ones(fw.shape[:-1]).astype("float32")
 
-  f = np.flip(f, 0)
-  b = np.flip(b, 0)
 
-  write_pfm(
-      f"{out_dir}/LASR/FlowFW/Full-Resolution/{FLAGS.object}/flo-{i:05d}.pfm", f)
-  write_pfm(
-      f"{out_dir}/LASR/FlowBW/Full-Resolution/{FLAGS.object}/flo-{i+1:05d}.pfm", b)
-  write_pfm(f"{out_dir}/LASR/FlowFW/Full-Resolution/{FLAGS.object}/occ-{i:05d}.pfm",
-            np.ones_like(occs[i, ...]))
-  write_pfm(f"{out_dir}/LASR/FlowBW/Full-Resolution/{FLAGS.object}/occ-{i+1:05d}.pfm",
-            np.ones_like(occs[i, ...]))
+# os.makedirs(
+#     f"{out_dir}/LASR/FlowFW/Full-Resolution/{FLAGS.object}", exist_ok=True)
+# os.makedirs(
+#     f"{out_dir}/LASR/FlowBW/Full-Resolution/{FLAGS.object}", exist_ok=True)
+# os.makedirs(
+#     f"{out_dir}/LASR/FlowFW/Full-Resolution/r{FLAGS.object}", exist_ok=True)
+# os.makedirs(
+#     f"{out_dir}/LASR/FlowBW/Full-Resolution/r{FLAGS.object}", exist_ok=True)
+# os.makedirs(
+#     f"{out_dir}/LASR/Camera/Full-Resolution/{FLAGS.object}", exist_ok=True)
+# os.makedirs(
+#     f"{out_dir}/LASR/Camera/Full-Resolution/r{FLAGS.object}", exist_ok=True)
 
-  write_pfm(
-      f"{out_dir}/LASR/FlowFW/Full-Resolution/r{FLAGS.object}/flo-{i:05d}.pfm", f)
-  write_pfm(
-      f"{out_dir}/LASR/FlowBW/Full-Resolution/r{FLAGS.object}/flo-{i+1:05d}.pfm", b)
-  write_pfm(f"{out_dir}/LASR/FlowFW/Full-Resolution/r{FLAGS.object}/occ-{i:05d}.pfm",
-            np.ones_like(occs[i, ...]))
-  write_pfm(f"{out_dir}/LASR/FlowBW/Full-Resolution/r{FLAGS.object}/occ-{i+1:05d}.pfm",
-            np.ones_like(occs[i, ...]))
+# # write flows into pfm
+# for i in range(len(fw)):
+#   f = fw[i, ...]
+#   ones = np.ones_like(f[..., :1])
+#   f = np.concatenate([f[..., 1:], f[..., :1], ones], -1)
+#   b = np.concatenate([-bw[i, ..., 1:], -bw[i, ..., :1], ones], -1)
 
-for i in range(len(cam_params)):
-  # save camera parameters
-  np.savetxt(
-      f"{out_dir}/LASR/Camera/Full-Resolution/{FLAGS.object}/{i:05d}.txt", cam_params[i].T)
-  np.savetxt(
-      f"{out_dir}/LASR/Camera/Full-Resolution/r{FLAGS.object}/{i:05d}.txt", cam_params[i].T)
+#   f = np.flip(f, 0)
+#   b = np.flip(b, 0)
 
-# write gif
-imageio.mimsave(
-    str(kb.as_path(f"{out_dir}/") / f"{FLAGS.object}.gif"), frames_dict["rgba"])
-kb.file_io.write_flow_batch(
-    frames_dict["forward_flow"],
-    directory=f"{out_dir}/FlowFW", file_template="{:05d}.png", name="forward_flow",
-    max_write_threads=16
-)
-kb.file_io.write_flow_batch(
-    frames_dict["backward_flow"],
-    directory=f"{out_dir}/FlowBW",
-    file_template="{:05d}.png",
-    name="backward_flow",
-    max_write_threads=16
-)
+#   write_pfm(
+#       f"{out_dir}/LASR/FlowFW/Full-Resolution/{FLAGS.object}/flo-{i:05d}.pfm", f)
+#   write_pfm(
+#       f"{out_dir}/LASR/FlowBW/Full-Resolution/{FLAGS.object}/flo-{i+1:05d}.pfm", b)
+#   write_pfm(f"{out_dir}/LASR/FlowFW/Full-Resolution/{FLAGS.object}/occ-{i:05d}.pfm",
+#             np.ones_like(occs[i, ...]))
+#   write_pfm(f"{out_dir}/LASR/FlowBW/Full-Resolution/{FLAGS.object}/occ-{i+1:05d}.pfm",
+#             np.ones_like(occs[i, ...]))
+
+#   write_pfm(
+#       f"{out_dir}/LASR/FlowFW/Full-Resolution/r{FLAGS.object}/flo-{i:05d}.pfm", f)
+#   write_pfm(
+#       f"{out_dir}/LASR/FlowBW/Full-Resolution/r{FLAGS.object}/flo-{i+1:05d}.pfm", b)
+#   write_pfm(f"{out_dir}/LASR/FlowFW/Full-Resolution/r{FLAGS.object}/occ-{i:05d}.pfm",
+#             np.ones_like(occs[i, ...]))
+#   write_pfm(f"{out_dir}/LASR/FlowBW/Full-Resolution/r{FLAGS.object}/occ-{i+1:05d}.pfm",
+#             np.ones_like(occs[i, ...]))
+
+# for i in range(len(cam_params)):
+#   # save camera parameters
+#   np.savetxt(
+#       f"{out_dir}/LASR/Camera/Full-Resolution/{FLAGS.object}/{i:05d}.txt", cam_params[i].T)
+#   np.savetxt(
+#       f"{out_dir}/LASR/Camera/Full-Resolution/r{FLAGS.object}/{i:05d}.txt", cam_params[i].T)
+
+# # write gif
+# imageio.mimsave(
+#     str(kb.as_path(f"{out_dir}/") / f"{FLAGS.object}.gif"), frames_dict["rgba"])
+# kb.file_io.write_flow_batch(
+#     frames_dict["forward_flow"],
+#     directory=f"{out_dir}/FlowFW", file_template="{:05d}.png", name="forward_flow",
+#     max_write_threads=16
+# )
+# kb.file_io.write_flow_batch(
+#     frames_dict["backward_flow"],
+#     directory=f"{out_dir}/FlowBW",
+#     file_template="{:05d}.png",
+#     name="backward_flow",
+#     max_write_threads=16
+# )
 
 logging.info("Collecting and storing metadata for each object.")
 kb.write_json(filename=f"{out_dir}/metadata.json", data={

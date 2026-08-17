@@ -53,7 +53,9 @@ VELOCITY_RANGE = [(-4., -4., 0.), (4., 4., 0.)]
 CLEVR_OBJECTS = ("cube", "cylinder", "sphere")
 KUBASIC_OBJECTS = ("cube", "cylinder", "sphere", "cone", "torus", "gear",
                    "torus_knot", "sponge", "spot", "teapot", "suzanne")
+PHYSICS_OBJECTS = ("sphere", "cube", "cylinder", "suzanne", "gear", "torus_knot")
 POINT_STATE_FILENAME = "point_cloud_states.pkl"
+PHYSICS_FILENAME = "physics.npz"
 POINT_STATE_COMPONENTS = (
     "position_x", "position_y", "position_z",
     "velocity_x", "velocity_y", "velocity_z",
@@ -71,6 +73,123 @@ def _temporary_numpy_seed(seed):
     yield
   finally:
     np.random.set_state(previous_state)
+
+
+def _parse_range(value, name, expected_length=2):
+  parts = [float(part) for part in str(value).split(",")]
+  if len(parts) != expected_length:
+    raise ValueError(f"{name} must contain {expected_length} comma-separated values.")
+  if expected_length == 2 and parts[0] > parts[1]:
+    raise ValueError(f"{name} lower bound must be <= upper bound.")
+  return tuple(parts)
+
+
+def _sample_unit_vector(rng, dimensions=3):
+  vector = rng.normal(size=(dimensions,))
+  norm = np.linalg.norm(vector)
+  while norm < 1e-8:
+    vector = rng.normal(size=(dimensions,))
+    norm = np.linalg.norm(vector)
+  return vector / norm
+
+
+def _choose_shape_name(flags, rng, object_index):
+  if flags.physics_diversity:
+    if flags.physics_shape_selection == "cycle":
+      if flags.shape_cycle_index >= 0:
+        cycle_index = flags.shape_cycle_index + object_index
+      elif flags.seed is not None:
+        cycle_index = flags.seed + object_index
+      else:
+        cycle_index = rng.randint(0, 2**31 - 1) + object_index
+      return PHYSICS_OBJECTS[cycle_index % len(PHYSICS_OBJECTS)]
+    return rng.choice(PHYSICS_OBJECTS)
+  if flags.objects_set == "clevr":
+    return rng.choice(CLEVR_OBJECTS)
+  return rng.choice(KUBASIC_OBJECTS)
+
+
+def _sample_log_uniform(rng, minimum, maximum):
+  return float(np.exp(rng.uniform(np.log(minimum), np.log(maximum))))
+
+
+def _place_for_contact_window(obj, simulator, rng, flags):
+  contact_frame_min, contact_frame_max = _parse_range(
+      flags.target_contact_frames, "--target_contact_frames")
+  spawn_xy_min, spawn_xy_max = _parse_range(flags.physics_spawn_xy, "--physics_spawn_xy")
+  vertical_velocity_min, vertical_velocity_max = _parse_range(
+      flags.vertical_velocity_range, "--vertical_velocity_range")
+  gravity = abs(float(simulator.scene.gravity[2]))
+  if gravity <= 0.0:
+    gravity = 9.81
+
+  for _ in range(flags.physics_placement_trials):
+    obj.quaternion = kb.randomness.random_rotation(rng=rng)
+    target_frame = rng.uniform(contact_frame_min, contact_frame_max)
+    target_time = target_frame / float(simulator.scene.frame_rate)
+    vertical_velocity = rng.uniform(vertical_velocity_min, vertical_velocity_max)
+    drop_clearance = max(
+        0.1,
+        0.5 * gravity * target_time**2 - vertical_velocity * target_time)
+    floor_z = float(flags.contact_floor_z)
+    obj.position = (
+        rng.uniform(spawn_xy_min, spawn_xy_max),
+        rng.uniform(spawn_xy_min, spawn_xy_max),
+        0.0,
+    )
+    bottom_offset = float(obj.aabbox[0, 2])
+    obj.position = (
+        obj.position[0],
+        obj.position[1],
+        floor_z + drop_clearance - bottom_offset,
+    )
+    if not simulator.check_overlap(obj):
+      return vertical_velocity, target_frame, drop_clearance
+
+  logging.warning(
+      "Contact-window placement failed for %s; falling back to broad spawn region.",
+      obj.uid)
+  kb.move_until_no_overlap(obj, simulator, spawn_region=SPAWN_REGION, rng=rng)
+  return rng.uniform(vertical_velocity_min, vertical_velocity_max), None, None
+
+
+def _apply_physics_diversity(obj, rng, flags, size, vertical_velocity):
+  mass_min, mass_max = _parse_range(flags.mass_range, "--mass_range")
+  friction_min, friction_max = _parse_range(flags.friction_range, "--friction_range")
+  restitution_min, restitution_max = _parse_range(
+      flags.restitution_range, "--restitution_range")
+  linear_speed_min, linear_speed_max = _parse_range(
+      flags.linear_velocity_range, "--linear_velocity_range")
+  angular_speed_min, angular_speed_max = _parse_range(
+      flags.angular_velocity_range, "--angular_velocity_range")
+
+  if flags.mass_sampling == "log":
+    obj.mass = _sample_log_uniform(rng, mass_min, mass_max)
+  else:
+    obj.mass = float(rng.uniform(mass_min, mass_max))
+  obj.friction = float(rng.uniform(friction_min, friction_max))
+  obj.restitution = float(rng.uniform(restitution_min, restitution_max))
+
+  xy_direction = _sample_unit_vector(rng, dimensions=2)
+  xy_speed = rng.uniform(linear_speed_min, linear_speed_max)
+  obj.velocity = (
+      float(xy_direction[0] * xy_speed),
+      float(xy_direction[1] * xy_speed),
+      float(vertical_velocity),
+  )
+
+  angular_axis = _sample_unit_vector(rng, dimensions=3)
+  angular_speed = rng.uniform(angular_speed_min, angular_speed_max)
+  obj.angular_velocity = tuple((angular_axis * angular_speed).astype(float))
+  obj.metadata.update({
+      "mass": float(obj.mass),
+      "friction": float(obj.friction),
+      "restitution": float(obj.restitution),
+      "initial_velocity": tuple(float(v) for v in obj.velocity),
+      "initial_angular_velocity": tuple(float(v) for v in obj.angular_velocity),
+      "mass_sampling": flags.mass_sampling,
+      "base_size": float(size),
+  })
 
 
 def _load_render_mesh(obj, mesh_cache):
@@ -489,14 +608,78 @@ def _collect_point_cloud_states(
       "instances": instances,
   }
 
+
+def _build_physics_payload(
+    point_cloud_states,
+    animation,
+    contact_forces,
+    assets,
+    simulator,
+    floor,
+    simulation_frame_start=0,
+):
+  """Build PV-Simulator physics arrays aligned with sampled point states."""
+  x_s_raw = np.asarray(point_cloud_states["point_states"], dtype=np.float32)
+  frame_ids = np.asarray(point_cloud_states["frame_ids"], dtype=np.int64)
+  instances = point_cloud_states["instances"]
+  num_frames, num_points, _ = x_s_raw.shape
+  num_objects = len(instances)
+
+  c_force_raw = np.zeros((num_frames, num_points, 6), dtype=np.float32)
+  point_obj_idx = np.zeros((num_points,), dtype=np.int64)
+  c_mat = np.zeros((num_objects, 2), dtype=np.float32)
+  c_mass = np.zeros((num_objects,), dtype=np.float32)
+  c_static = np.zeros((num_objects,), dtype=np.int64)
+  c_init = np.zeros((num_objects, 7), dtype=np.float32)
+
+  assets_by_uid = {asset.uid: asset for asset in assets}
+  contact_indices = frame_ids - simulation_frame_start
+  for object_idx, instance in enumerate(instances):
+    point_start, point_end = instance["point_range"]
+    point_obj_idx[point_start:point_end] = object_idx
+    obj = assets_by_uid[instance["uid"]]
+    bullet_idx = obj.linked_objects[simulator]
+    dynamics = simulator.get_dynamics_info(bullet_idx)
+    c_mass[object_idx] = dynamics[0]
+    c_mat[object_idx] = (dynamics[1], dynamics[5])  # friction, restitution
+    c_static[object_idx] = int(dynamics[0] == 0.0)
+
+    animation_index = int(contact_indices[0])
+    c_init[object_idx, :3] = animation[obj]["position"][animation_index]
+    c_init[object_idx, 3:6] = animation[obj]["velocity"][animation_index]
+    c_init[object_idx, 6] = 1.0
+
+    contact_data = contact_forces.get(obj)
+    if contact_data is None:
+      continue
+    if np.any(contact_indices < 0) or np.any(contact_indices >= len(contact_data["force"])):
+      raise ValueError("Point-state frame IDs are outside the simulated contact-force range.")
+    object_force = contact_data["force"][contact_indices]
+    object_contact_point = contact_data["contact_point"][contact_indices]
+    c_force_raw[:, point_start:point_end, :3] = object_force[:, None, :]
+    c_force_raw[:, point_start:point_end, 3:] = object_contact_point[:, None, :]
+
+  floor_bullet_idx = floor.linked_objects[simulator]
+  floor_position, _ = simulator.get_position_and_rotation(floor_bullet_idx)
+  return {
+      "x_s_raw": x_s_raw,
+      "c_force_raw": c_force_raw,
+      "c_floor": np.asarray(float(floor_position[2]), dtype=np.float32),
+      "c_mat": c_mat,
+      "c_mass": c_mass,
+      "c_static": c_static,
+      "c_init": c_init,
+      "point_obj_idx": point_obj_idx,
+  }
+
 # --- CLI arguments
 parser = kb.ArgumentParser()
 # Configuration for the objects of the scene
 parser.add_argument("--objects_set", choices=["clevr", "kubasic"],
                     default="clevr")
-parser.add_argument("--min_num_objects", type=int, default=3,
+parser.add_argument("--min_num_objects", type=int, default=2,
                     help="minimum number of objects")
-parser.add_argument("--max_num_objects", type=int, default=10,
+parser.add_argument("--max_num_objects", type=int, default=2,
                     help="maximum number of objects")
 # Configuration for the floor and background
 parser.add_argument("--floor_friction", type=float, default=0.3)
@@ -510,6 +693,10 @@ parser.add_argument("--camera", choices=["clevr", "random"], default="clevr")
 # Configuration for the source of the assets
 parser.add_argument("--kubasic_assets", type=str,
                     default="gs://kubric-public/assets/KuBasic/KuBasic.json")
+parser.add_argument("--asset_cache_dir", type=str, default=None,
+                    help="Persistent local cache directory for manifests and downloaded "
+                         "asset archives. When set, repeated workers reuse local copies "
+                         "instead of refetching from remote storage.")
 parser.add_argument("--save_state", dest="save_state", action="store_true")
 parser.add_argument("--point_count_strategy", choices=["fixed", "adaptive"],
                     default="fixed",
@@ -540,6 +727,35 @@ parser.add_argument("--min_volume_points_per_object", type=int, default=16,
 parser.add_argument("--max_volume_points_per_object", type=int, default=-1,
                     help="Adaptive mode only. Maximum number of interior points per "
                          "foreground object. Use -1 to disable the cap.")
+parser.add_argument("--physics_diversity", action="store_true",
+                    help="Enable broader physics sampling for trajectory datasets.")
+parser.add_argument("--physics_shape_selection", choices=["random", "cycle"],
+                    default="random",
+                    help="Shape selection mode used when --physics_diversity is enabled.")
+parser.add_argument("--shape_cycle_index", type=int, default=-1,
+                    help="Cycle index for deterministic shape coverage. Defaults to seed.")
+parser.add_argument("--mass_range", type=str, default="0.5,5.0",
+                    help="Min,max object mass range in kg for --physics_diversity.")
+parser.add_argument("--mass_sampling", choices=["linear", "log"], default="log",
+                    help="Mass sampling distribution for --physics_diversity.")
+parser.add_argument("--friction_range", type=str, default="0.1,0.8",
+                    help="Min,max object friction range for --physics_diversity.")
+parser.add_argument("--restitution_range", type=str, default="0.2,0.8",
+                    help="Min,max object restitution range for --physics_diversity.")
+parser.add_argument("--linear_velocity_range", type=str, default="0.5,4.0",
+                    help="Min,max horizontal initial speed for --physics_diversity.")
+parser.add_argument("--vertical_velocity_range", type=str, default="-0.25,0.25",
+                    help="Min,max vertical initial speed for contact-window placement.")
+parser.add_argument("--angular_velocity_range", type=str, default="0.5,8.0",
+                    help="Min,max initial angular speed for --physics_diversity.")
+parser.add_argument("--target_contact_frames", type=str, default="8,12",
+                    help="Target first-contact frame range for --physics_diversity.")
+parser.add_argument("--physics_spawn_xy", type=str, default="-3.0,3.0",
+                    help="Min,max XY spawn range for contact-window placement.")
+parser.add_argument("--contact_floor_z", type=float, default=0.0,
+                    help="Approximate floor contact Z used for contact-window placement.")
+parser.add_argument("--physics_placement_trials", type=int, default=100,
+                    help="Maximum placement attempts for --physics_diversity.")
 parser.set_defaults(save_state=False, frame_end=24, frame_rate=12,
                     resolution=256)
 FLAGS = parser.parse_args()
@@ -553,18 +769,21 @@ print("finish simulator setup")
 renderer = Blender(scene, scratch_dir, samples_per_pixel=16)
 print("finish renderer setup")
 print("before AssetSource.from_manifest")
-kubasic = kb.AssetSource.from_manifest(FLAGS.kubasic_assets)
+kubasic = kb.AssetSource.from_manifest(
+    FLAGS.kubasic_assets,
+    cache_dir=FLAGS.asset_cache_dir)
 print("after AssetSource.from_manifest")
 
 # --- Populate the scene
 # Floor / Background
 logging.info("Creating a large gray floor...")
 floor_material = kb.PrincipledBSDFMaterial(roughness=1., specular=0.)
-scene += kubasic.create("dome", name="floor", material=floor_material,
-                        scale=2.0,
-                        friction=FLAGS.floor_friction,
-                        restitution=FLAGS.floor_restitution,
-                        static=True, background=True)
+floor = kubasic.create("dome", name="floor", material=floor_material,
+                       scale=2.0,
+                       friction=FLAGS.floor_friction,
+                       restitution=FLAGS.floor_restitution,
+                       static=True, background=True)
+scene += floor
 if FLAGS.background == "clevr":
   floor_material.color = kb.Color.from_name("gray")
   scene.metadata["background"] = "clevr"
@@ -594,12 +813,15 @@ num_objects = rng.randint(FLAGS.min_num_objects,
                           FLAGS.max_num_objects+1)
 logging.info("Randomly placing %d objects:", num_objects)
 for i in range(num_objects):
-  if FLAGS.objects_set == "clevr":
-    shape_name = rng.choice(CLEVR_OBJECTS)
+  shape_name = _choose_shape_name(FLAGS, rng, i)
+  if FLAGS.objects_set == "clevr" and not FLAGS.physics_diversity:
     size_label, size = kb.randomness.sample_sizes("clevr", rng)
     color_label, random_color = kb.randomness.sample_color("clevr", rng)
-  else:  # FLAGS.object_set == "kubasic":
+  elif FLAGS.objects_set == "kubasic" and not FLAGS.physics_diversity:
     shape_name = rng.choice(KUBASIC_OBJECTS)
+    size_label, size = kb.randomness.sample_sizes("uniform", rng)
+    color_label, random_color = kb.randomness.sample_color("uniform_hue", rng)
+  else:
     size_label, size = kb.randomness.sample_sizes("uniform", rng)
     color_label, random_color = kb.randomness.sample_color("uniform_hue", rng)
 
@@ -632,10 +854,19 @@ for i in range(num_objects):
       "color_label": color_label,
   }
   scene.add(obj)
-  kb.move_until_no_overlap(obj, simulator, spawn_region=SPAWN_REGION, rng=rng)
-  # initialize velocity randomly but biased towards center
-  obj.velocity = (rng.uniform(*VELOCITY_RANGE) -
-                  [obj.position[0], obj.position[1], 0])
+  if FLAGS.physics_diversity:
+    vertical_velocity, target_contact_frame, drop_clearance = _place_for_contact_window(
+        obj, simulator, rng, FLAGS)
+    _apply_physics_diversity(obj, rng, FLAGS, size, vertical_velocity)
+    obj.metadata["target_contact_frame"] = (
+        None if target_contact_frame is None else float(target_contact_frame))
+    obj.metadata["drop_clearance"] = (
+        None if drop_clearance is None else float(drop_clearance))
+  else:
+    kb.move_until_no_overlap(obj, simulator, spawn_region=SPAWN_REGION, rng=rng)
+    # initialize velocity randomly but biased towards center
+    obj.velocity = (rng.uniform(*VELOCITY_RANGE) -
+                    [obj.position[0], obj.position[1], 0])
 
   logging.info("    Added %s at %s", obj.asset_id, obj.position)
 
@@ -648,8 +879,11 @@ if FLAGS.save_state:
 
 # Run dynamic objects simulation
 logging.info("Running the simulation ...")
-animation, collisions = simulator.run(frame_start=0,
-                                      frame_end=scene.frame_end+1)
+animation, collisions, contact_forces = simulator.run(
+    frame_start=0,
+    frame_end=scene.frame_end+1,
+    return_contact_forces=True,
+)
 
 # --- Rendering
 if FLAGS.save_state:
@@ -659,7 +893,7 @@ if FLAGS.save_state:
 
 
 logging.info("Rendering the scene ...")
-data_stack = renderer.render()
+data_stack = renderer.render(return_layers=("rgba", "depth", "normal", "segmentation"))
 
 # --- Postprocessing
 kb.compute_visibility(data_stack["segmentation"], scene.assets)
@@ -684,6 +918,7 @@ kb.post_processing.compute_bboxes(data_stack["segmentation"],
 # --- Point states
 point_cloud_states = None
 point_cloud_state_summary = None
+physics_summary = None
 if _point_sampling_enabled(FLAGS):
   logging.info("Sampling foreground points with %s point-count strategy.",
                FLAGS.point_count_strategy)
@@ -701,6 +936,31 @@ if _point_sampling_enabled(FLAGS):
         instance_summary["uid"], -1)
 
   kb.write_pkl(point_cloud_states, output_dir / POINT_STATE_FILENAME)
+  physics_payload = _build_physics_payload(
+      point_cloud_states=point_cloud_states,
+      animation=animation,
+      contact_forces=contact_forces,
+      assets=scene.foreground_assets,
+      simulator=simulator,
+      floor=floor,
+      simulation_frame_start=0,
+  )
+  np.savez_compressed(output_dir / PHYSICS_FILENAME, **physics_payload)
+  force_norm_by_frame = np.linalg.norm(
+      physics_payload["c_force_raw"][..., :3], axis=-1).max(axis=1)
+  force_nonzero_frames = np.flatnonzero(force_norm_by_frame > 1e-6).astype(int)
+  physics_summary = {
+      "filename": PHYSICS_FILENAME,
+      "shape": list(physics_payload["x_s_raw"].shape),
+      "force_nonzero_threshold": 1e-6,
+      "force_nonzero_frames": force_nonzero_frames.tolist(),
+      "first_contact_frame": (
+          None if force_nonzero_frames.size == 0 else int(force_nonzero_frames[0])),
+      "post_contact_frames": (
+          0 if force_nonzero_frames.size == 0
+          else int(physics_payload["x_s_raw"].shape[0] - force_nonzero_frames[0] - 1)),
+      "floor_height": float(physics_payload["c_floor"]),
+  }
   point_cloud_instances_summary = []
   for instance_payload in point_cloud_states["instances"]:
     instance_summary = {
@@ -757,6 +1017,8 @@ metadata = {
 }
 if point_cloud_state_summary is not None:
   metadata["point_cloud_states"] = point_cloud_state_summary
+if physics_summary is not None:
+  metadata["physics"] = physics_summary
 kb.write_json(filename=output_dir / "metadata.json", data=metadata)
 kb.write_json(filename=output_dir / "events.json", data={
     "collisions":  kb.process_collisions(

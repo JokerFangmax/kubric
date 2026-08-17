@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from kubric import core
 from kubric.redirect_io import RedirectStream
+import numpy as np
 import tensorflow as tf
 
 # --- hides the "pybullet build time: May 26 2021 18:52:36" message on import
@@ -211,6 +212,10 @@ class PyBullet(core.View):
     velocity, angular_velocity = self._physics_client.getBaseVelocity(obj_idx)
     return velocity, angular_velocity
 
+  def get_dynamics_info(self, obj_idx: int):
+    """Return PyBullet dynamics properties for the object's base link."""
+    return self._physics_client.getDynamicsInfo(obj_idx, -1)
+
   def save_state(self, path: Union[pathlib.Path, str] = "scene.bullet"):
     """Receives a folder path as input."""
     assert self.scratch_dir is not None
@@ -221,8 +226,13 @@ class PyBullet(core.View):
   def run(
       self,
       frame_start: int = 0,
-      frame_end: Optional[int] = None
-  ) -> Tuple[Dict[core.PhysicalObject, Dict[str, list]], List[dict]]:
+      frame_end: Optional[int] = None,
+      return_contact_forces: bool = False,
+  ) -> Union[
+      Tuple[Dict[core.PhysicalObject, Dict[str, list]], List[dict]],
+      Tuple[Dict[core.PhysicalObject, Dict[str, list]], List[dict],
+            Dict[core.PhysicalObject, Dict[str, np.ndarray]]],
+  ]:
     """
     Run the physics simulation.
 
@@ -234,9 +244,12 @@ class PyBullet(core.View):
         Also the first frame for which keyframes are stored.
       frame_end: The last frame (inclusive) that is simulated (and for which animations
         are computed).
+      return_contact_forces: Whether to additionally return per-rendered-frame
+        net contact forces and mean contact points for each simulated asset.
 
     Returns:
-      A dict of all animations and a list of all collision events.
+      A dict of all animations and a list of collision events. When
+      ``return_contact_forces`` is true, also returns per-asset contact data.
     """
 
     frame_end = self.scene.frame_end if frame_end is None else frame_end
@@ -249,6 +262,18 @@ class PyBullet(core.View):
     ]
     animation = {obj_id: {"position": [], "quaternion": [], "velocity": [], "angular_velocity": []}
                  for obj_id in obj_idxs}
+
+    contact_force_accumulators = None
+    if return_contact_forces:
+      num_animation_frames = frame_end - frame_start + 1
+      contact_force_accumulators = {
+          obj_id: {
+              "force_sum": np.zeros((num_animation_frames, 3), dtype=np.float32),
+              "contact_point_sum": np.zeros((num_animation_frames, 3), dtype=np.float32),
+              "contact_count": np.zeros((num_animation_frames,), dtype=np.int32),
+          }
+          for obj_id in obj_idxs
+      }
 
     collisions = []
     for current_step in range(max_step):
@@ -263,9 +288,7 @@ class PyBullet(core.View):
          lateral_friction1, lateral_friction_dir1,
          lateral_friction2, lateral_friction_dir2) = collision
         del link_a, link_b  # < unused
-        del contact_flag, contact_distance, position_a  # < unused
-        del lateral_friction1, lateral_friction2  # < unused
-        del lateral_friction_dir1, lateral_friction_dir2  # < unused
+        del contact_flag, contact_distance  # < unused
         if normal_force > 1e-6:
           collisions.append({
               "instances": (self._obj_idx_to_asset(body_b), self._obj_idx_to_asset(body_a)),
@@ -274,6 +297,27 @@ class PyBullet(core.View):
               "frame": current_step / steps_per_frame,
               "force": normal_force,
           })
+          if contact_force_accumulators is not None:
+            frame_idx = current_step // steps_per_frame
+            # ``contact_normal_b`` points from B toward A. The force applied
+            # to A is therefore +normal; B receives the equal-and-opposite one.
+            normal = np.asarray(contact_normal_b, dtype=np.float32)
+            friction_force = (
+                lateral_friction1 * np.asarray(lateral_friction_dir1, dtype=np.float32)
+                + lateral_friction2 * np.asarray(lateral_friction_dir2, dtype=np.float32)
+            )
+            force_on_a = normal_force * normal + friction_force
+            force_on_b = -force_on_a
+            if body_a in contact_force_accumulators:
+              accumulator = contact_force_accumulators[body_a]
+              accumulator["force_sum"][frame_idx] += force_on_a
+              accumulator["contact_point_sum"][frame_idx] += position_a
+              accumulator["contact_count"][frame_idx] += 1
+            if body_b in contact_force_accumulators:
+              accumulator = contact_force_accumulators[body_b]
+              accumulator["force_sum"][frame_idx] += force_on_b
+              accumulator["contact_point_sum"][frame_idx] += position_b
+              accumulator["contact_count"][frame_idx] += 1
 
       if current_step % steps_per_frame == 0:
         for obj_idx in obj_idxs:
@@ -302,7 +346,28 @@ class PyBullet(core.View):
         obj.keyframe_insert("velocity", frame_id + frame_start)
         obj.keyframe_insert("angular_velocity", frame_id + frame_start)
 
-    return animation, collisions
+    if contact_force_accumulators is None:
+      return animation, collisions
+
+    contact_forces = {}
+    for obj_idx, accumulator in contact_force_accumulators.items():
+      contact_count = accumulator["contact_count"]
+      contact_point = np.zeros_like(accumulator["contact_point_sum"])
+      has_contact = contact_count > 0
+      contact_point[has_contact] = (
+          accumulator["contact_point_sum"][has_contact]
+          / contact_count[has_contact, None]
+      )
+      asset = self._obj_idx_to_asset(obj_idx)
+      if asset is not None:
+        # Keep force units in Newtons by averaging over substeps, rather than
+        # reporting an impulse that grows with the simulation step rate.
+        contact_forces[asset] = {
+            "force": accumulator["force_sum"] / steps_per_frame,
+            "contact_point": contact_point,
+            "contact_count": contact_count,
+        }
+    return animation, collisions, contact_forces
 
   def _obj_idx_to_asset(self, idx):
     assets = [asset for asset in self.scene.assets if asset.linked_objects.get(self) == idx]

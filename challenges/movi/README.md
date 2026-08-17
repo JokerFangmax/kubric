@@ -157,6 +157,46 @@ See [movi_b.py](movi_b.py) for the TFDS definition / conversion.
 ds = tfds.load("movi_b", data_dir="gs://kubric-public/tfds") 
 ```
 
+### Recommended raw-plus-shards workflow
+
+For large local MOVi variants such as a custom `movi_ab_50k`, keep two copies of
+the dataset with different purposes:
+
+- `raw/`: the original per-sample directories produced by the workers. Keep this
+  as the lossless source of truth for inspection, repair, or repacking.
+- `shards/`: a separate sharded dataset for training and cross-machine
+  distribution. Training jobs should read only from this copy.
+
+The repository includes a packer that converts the raw directory tree into
+either WebDataset shards, TFRecord shards, or both:
+
+```shell
+python3 -m challenges.movi.movi_shards \
+  --source-root output/movi_ab_50k_raw \
+  --output-root output/movi_ab_50k_shards \
+  --format both \
+  --shard-size 1000
+```
+
+`TFRecord` export requires a Python environment with `tensorflow` installed. If
+you only need PyTorch-style sequential shard loading, use `--format
+webdataset`.
+
+This creates:
+
+- `output/movi_ab_50k_shards/webdataset/shards/shard-000000.tar`, ...
+- `output/movi_ab_50k_shards/tfrecord/shards/shard-000000.tfrecord`, ...
+- `dataset_manifest.json` and `manifest.jsonl` indexes for each format
+
+The produced shards store each sample losslessly as:
+
+- a per-sample manifest with sizes, filenames, and shard placement
+- a per-sample payload tar containing the exact original files from the raw
+  sample directory
+
+That design keeps the raw directory layout recoverable while replacing random
+small-file I/O with sequential shard reads during training and distribution.
+
 #### Variant specific Annotations
 In addition to the general information (see below), MOVi-B contains the following additional information:
 - **"background_color"**: `(3,) [float32]`  
